@@ -1,47 +1,69 @@
 # Human Sense AI
 
-A Python-based computer-vision prototype for human activity and gesture recognition, built for a time-limited AI vision hackathon.
+**Real-time human activity and gesture recognition using computer vision.**
 
-## Overview
+Human Sense AI is a Python desktop prototype developed during an AI vision hackathon. It uses a live camera feed and landmark-based visual processing to explore human pose, hand gestures, and basic activity cues.
 
-Human Sense AI explores how a camera feed can be processed to recognize human movement and gestures in real time. The project brings together a desktop interface and computer-vision components in one runnable prototype.
+> **Project status:** Hackathon prototype — intended for experimentation and learning, not as a validated or production-ready activity recognition system.
 
-## Tech Stack
+## What it does
 
-- **Python** — application logic
-- **OpenCV (cv2)** — camera input and image/video processing
-- **MediaPipe** — real-time perception and landmark-processing components
-- **NumPy** — numerical operations
-- **Tkinter** — desktop user interface
+- Captures live video through OpenCV.
+- Uses MediaPipe perception components to process hand and pose landmarks.
+- Calculates geometric features from detected landmarks.
+- Estimates basic activity cues, such as standing or sitting, using heuristic rules.
+- Provides a desktop interface built with Tkinter.
 
-## Run the Project
+**Important:** The current activity logic includes hand-crafted geometric rules. It should not be described as a separately trained or validated activity-classification model unless that implementation is added and evaluated.
+
+## Technology
+
+| Component | Role |
+| --- | --- |
+| Python | Application logic |
+| OpenCV | Camera capture and image processing |
+| MediaPipe | Hand and pose landmark detection |
+| NumPy | Numerical operations |
+| Tkinter | Desktop interface |
+
+## Run on Windows
 
 1. Clone or download this repository.
 2. Open the project folder in VS Code.
-3. Make sure Python and the project's required packages are installed.
-4. Check that any required model assets are present in the expected locations.
-5. Run the project's launch script, `Launch Human Sense AI.bat`, on Windows, or launch the main Python entry point from your configured environment.
+3. Set up a Python environment and install the dependencies required by the code.
+4. Confirm that the required model assets are present in the locations expected by the application.
+5. Run **Launch Human Sense AI.bat**.
 
-> **Note:** Exact setup commands depend on the dependency and model files included in the current project. Verify these files before running on a new machine.
+The launcher expects a project-local virtual environment at **.venv**. If your environment uses a different folder or the required packages are missing, update the launcher or run the application from your configured environment.
 
-## Project Status
+The project entry point is **src/gesture_demo.py**.
 
-This is a hackathon prototype. The code and setup may evolve as the project is refactored, documented, and tested on additional machines.
+## Repository layout
 
-## Data and Model Transparency
+- **src/gesture_demo.py** — main camera and landmark-processing application
+- **src/geture_demo.py** — compatibility entry point
+- **camera_test.py** — basic camera test
+- **Launch Human Sense AI.bat** — Windows launcher
 
-Before using this project for research or redistribution, document the exact origin, version, and license of each dataset and pretrained model used. Do not assume that a library's pretrained model was trained on a dataset collected by this project. Dataset and model provenance should be verified against the actual assets and implementation.
+## Limitations
 
-## Future Improvements
+- Detection quality depends on camera quality, lighting, framing, and landmark visibility.
+- The current activity estimates are heuristic and have not been presented as benchmarked model results.
+- Hardware and dependency compatibility may vary across machines.
+- No accuracy, latency, or dataset-performance claims are made without a reproducible evaluation.
 
-- Split the application into focused modules
-- Add a verified dependency list and reproducible setup instructions
-- Document the model pipeline and dataset/model sources
-- Add screenshots and a short demo
-- Add tests and graceful handling for unavailable cameras or missing model assets
+## Roadmap
+
+- Document exact installation steps and pinned dependencies.
+- Add a short demo and screenshots.
+- Record the source and license of each model asset and any dataset used.
+- Add tests and clearer handling for missing models or unavailable cameras.
+- Evaluate activity recognition against a documented dataset and report reproducible metrics.
+
+## Credits and asset licensing
+
+This project uses third-party computer-vision libraries and may require model assets. Check the applicable licenses and document the exact asset sources before redistributing or deploying the project.
 
 ## Author
 
 **Vanshaj Awasthi**
-
-Built as a learning project to explore practical computer vision and AI application development.
