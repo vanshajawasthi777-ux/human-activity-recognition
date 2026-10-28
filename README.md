@@ -2,68 +2,96 @@
 
 **Real-time human activity and gesture recognition using computer vision.**
 
-Human Sense AI is a Python desktop prototype developed during an AI vision hackathon. It uses a live camera feed and landmark-based visual processing to explore human pose, hand gestures, and basic activity cues.
+Human Sense AI is a Python desktop prototype developed during an AI vision hackathon. It processes a live camera feed and uses visual landmarks to explore hand gestures, human pose, and basic activity cues.
 
-> **Project status:** Hackathon prototype — intended for experimentation and learning, not as a validated or production-ready activity recognition system.
+> **Status:** Hackathon prototype for experimentation and learning. It has not been validated as a production-ready activity recognition system.
 
-## What it does
+## Features
 
-- Captures live video through OpenCV.
-- Uses MediaPipe perception components to process hand and pose landmarks.
-- Calculates geometric features from detected landmarks.
-- Estimates basic activity cues, such as standing or sitting, using heuristic rules.
-- Provides a desktop interface built with Tkinter.
+- Live camera capture and frame processing with OpenCV.
+- Hand gesture and pose landmark processing with MediaPipe.
+- Geometric feature calculations from detected landmarks.
+- Heuristic estimates for basic activity cues, including standing and sitting.
+- Desktop interface built with Tkinter.
 
-**Important:** The current activity logic includes hand-crafted geometric rules. It should not be described as a separately trained or validated activity-classification model unless that implementation is added and evaluated.
+> **Model note:** The current activity estimates use hand-crafted geometric rules. They are not evidence of a separately trained or benchmarked activity-classification model.
 
 ## Technology
 
-| Component | Role |
+| Technology | Purpose |
 | --- | --- |
 | Python | Application logic |
 | OpenCV | Camera capture and image processing |
-| MediaPipe | Hand and pose landmark detection |
+| MediaPipe | Hand gesture and pose landmarks |
 | NumPy | Numerical operations |
-| Tkinter | Desktop interface |
+| Tkinter | Desktop interface (included with many Python installations) |
 
-## Run on Windows
+## Getting started (Windows)
 
-1. Clone or download this repository.
-2. Open the project folder in VS Code.
-3. Set up a Python environment and install the dependencies required by the code.
-4. Confirm that the required model assets are present in the locations expected by the application.
-5. Run **Launch Human Sense AI.bat**.
+### 1. Clone the repository
 
-The launcher expects a project-local virtual environment at **.venv**. If your environment uses a different folder or the required packages are missing, update the launcher or run the application from your configured environment.
+```powershell
+git clone https://github.com/vanshajawasthi777-ux/human-activity-recognition.git
+cd human-activity-recognition
+```
 
-The project entry point is **src/gesture_demo.py**.
+### 2. Create a virtual environment
 
-## Repository layout
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+```
 
-- **src/gesture_demo.py** — main camera and landmark-processing application
-- **src/geture_demo.py** — compatibility entry point
-- **camera_test.py** — basic camera test
-- **Launch Human Sense AI.bat** — Windows launcher
+### 3. Install dependencies
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+### 4. Check model assets and launch
+
+Make sure the model files expected by the application are present in the repository's `models` directory. Then run:
+
+```powershell
+.\Launch Human Sense AI.bat
+```
+
+The launcher expects the virtual environment at `.venv`. If installation fails, check the Python version supported by the installed MediaPipe release and review the error output.
+
+## Repository structure
+
+```text
+human-activity-recognition/
+├── models/                     # Model assets used by the application
+├── src/
+│   ├── gesture_demo.py         # Main application
+│   └── geture_demo.py          # Compatibility entry point
+├── camera_test.py              # Basic camera test
+├── requirements.txt             # Runtime Python dependencies
+├── Launch Human Sense AI.bat    # Windows launcher
+└── .gitignore
+```
 
 ## Limitations
 
-- Detection quality depends on camera quality, lighting, framing, and landmark visibility.
-- The current activity estimates are heuristic and have not been presented as benchmarked model results.
-- Hardware and dependency compatibility may vary across machines.
-- No accuracy, latency, or dataset-performance claims are made without a reproducible evaluation.
+- Results depend on camera quality, lighting, framing, and landmark visibility.
+- Activity estimates are heuristic and have not been benchmarked against a labelled evaluation dataset.
+- Performance and dependency compatibility can vary across machines.
+- No accuracy or latency figures are claimed without reproducible testing.
 
-## Roadmap
+## Planned improvements
 
-- Document exact installation steps and pinned dependencies.
-- Add a short demo and screenshots.
-- Record the source and license of each model asset and any dataset used.
-- Add tests and clearer handling for missing models or unavailable cameras.
-- Evaluate activity recognition against a documented dataset and report reproducible metrics.
+- Verify and document supported Python and dependency versions.
+- Add screenshots and a short demo recording.
+- Document the source and license of every model asset and dataset.
+- Add tests and clearer handling for unavailable cameras or missing model files.
+- Evaluate recognition quality using a documented dataset and reproducible metrics.
 
-## Credits and asset licensing
+## Third-party assets
 
-This project uses third-party computer-vision libraries and may require model assets. Check the applicable licenses and document the exact asset sources before redistributing or deploying the project.
+This project depends on third-party computer-vision packages and model assets. Their respective licenses and redistribution conditions should be checked before reuse or deployment.
 
 ## Author
 
 **Vanshaj Awasthi**
+
