@@ -1,0 +1,4 @@
+# Core runtime dependencies for Human Sense AI
+opencv-python
+mediapipe
+numpy
