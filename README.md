@@ -2,6 +2,8 @@
 
 **Real-time human activity and gesture recognition using computer vision.**
 
+[![Python syntax check](https://github.com/vanshajawasthi777-ux/human-activity-recognition/actions/workflows/python-check.yml/badge.svg)](https://github.com/vanshajawasthi777-ux/human-activity-recognition/actions/workflows/python-check.yml)
+
 Human Sense AI is a Python desktop prototype developed during an AI vision hackathon. It processes a live camera feed and uses visual landmarks to explore hand gestures, human pose, and basic activity cues.
 
 > **Status:** Hackathon prototype for experimentation and learning. It has not been validated as a production-ready activity recognition system.
@@ -62,14 +64,31 @@ The launcher expects the virtual environment at `.venv`. If installation fails, 
 
 ```text
 human-activity-recognition/
-├── models/                     # Model assets used by the application
+├── .github/
+│   ├── ISSUE_TEMPLATE/bug_report.md
+│   ├── PULL_REQUEST_TEMPLATE.md
+│   └── workflows/python-check.yml
+├── assets/                     # Application assets
+├── models/                     # Model assets expected by the application
 ├── src/
 │   ├── gesture_demo.py         # Main application
 │   └── geture_demo.py          # Compatibility entry point
 ├── camera_test.py              # Basic camera test
-├── requirements.txt             # Runtime Python dependencies
-├── Launch Human Sense AI.bat    # Windows launcher
+├── requirements.txt            # Runtime Python dependencies
+├── CONTRIBUTING.md             # Contribution and validation guidance
+├── SECURITY.md                 # Security and privacy reporting guidance
+├── Launch Human Sense AI.bat   # Windows launcher
 └── .gitignore
+```
+
+## Validation
+
+GitHub Actions runs a Python syntax/compilation check for the source files on pushes and pull requests. This check does **not** install dependencies, launch the GUI, access a webcam, load model assets, or measure recognition quality. A passing check is not proof that the full application runs on every machine.
+
+To run the same syntax check locally:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src camera_test.py
 ```
 
 ## Limitations
@@ -82,16 +101,19 @@ human-activity-recognition/
 ## Planned improvements
 
 - Verify and document supported Python and dependency versions.
-- Add screenshots and a short demo recording.
+- Add screenshots and a short demo recording from a real run.
 - Document the source and license of every model asset and dataset.
-- Add tests and clearer handling for unavailable cameras or missing model files.
+- Add runtime tests and clearer handling for unavailable cameras or missing model files.
 - Evaluate recognition quality using a documented dataset and reproducible metrics.
 
 ## Third-party assets
 
-This project depends on third-party computer-vision packages and model assets. Their respective licenses and redistribution conditions should be checked before reuse or deployment.
+This project depends on third-party computer-vision packages and model assets. Check their respective licenses and redistribution conditions before reuse or deployment.
+
+## Contributing
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report reproducible problems using the repository's bug report template.
 
 ## Author
 
 **Vanshaj Awasthi**
-
