@@ -1,10 +1,12 @@
-"""MotionSense desktop dashboard for live hand gesture and pose activity."""
+"""Human Sense AI live hand gesture and pose analytics dashboard."""
 
 import base64
+import queue
 from collections import Counter, deque
 from pathlib import Path
 import sys
 import time
+import threading
 import tkinter as tk
 from tkinter import ttk
 
@@ -17,7 +19,7 @@ CAMERA_INDEX = 0
 NUM_HANDS = 2
 MIN_GESTURE_SCORE = 0.55
 MIN_LANDMARK_VISIBILITY = 0.40
-PANEL_WIDTH = 310
+PANEL_WIDTH = 360
 
 GESTURE_NAMES = {
     "Closed_Fist": "Closed Fist",
@@ -37,14 +39,22 @@ POSE = {"left_shoulder": 11, "right_shoulder": 12,
         "left_knee": 25, "right_knee": 26,
         "left_ankle": 27, "right_ankle": 28}
 
-BG = (20, 24, 32)
-PANEL = (29, 34, 44)
-WHITE = (238, 242, 247)
-MUTED = (153, 165, 181)
-TEAL = (100, 220, 190)
+POSE_TAGS = (("L SH", 11), ("R SH", 12), ("L EL", 13), ("R EL", 14),
+             ("L WR", 15), ("R WR", 16), ("L HIP", 23), ("R HIP", 24),
+             ("L KN", 25), ("R KN", 26), ("L ANK", 27), ("R ANK", 28))
+ANGLE_TRIPLETS = {
+    "elbow_left": (11, 13, 15), "elbow_right": (12, 14, 16),
+    "knee_left": (23, 25, 27), "knee_right": (24, 26, 28),
+}
+
+BG = (27, 20, 16)
+PANEL = (43, 32, 25)
+WHITE = (247, 242, 238)
+MUTED = (181, 165, 153)
+TEAL = (190, 220, 100)
 CYAN = (255, 190, 90)
 ORANGE = (60, 170, 255)
-PINK = (220, 120, 245)
+PINK = (245, 120, 220)
 
 BaseOptions = mp.tasks.BaseOptions
 Vision = mp.tasks.vision
@@ -156,17 +166,25 @@ def draw_pose(frame, landmarks):
             color, radius = (TEAL, 5) if i in key_joints else (WHITE, 3)
             cv2.circle(frame, point, radius + 2, (12, 18, 24), -1, cv2.LINE_AA)
             cv2.circle(frame, point, radius, color, -1, cv2.LINE_AA)
+    for label, index in POSE_TAGS:
+        point = pts[index]
+        if point is not None:
+            x = min(w - 42, max(2, point[0] + 7))
+            y = min(h - 4, max(12, point[1] - 7))
+            put_text(frame, label, (x, y), 0.28, TEAL, 1)
 
 
-def angle_degrees(a, b, c):
-    va = np.array([a.x - b.x, a.y - b.y], dtype=np.float32)
-    vc = np.array([c.x - b.x, c.y - b.y], dtype=np.float32)
+def angle_degrees(a, b, c, image_width=1.0, image_height=1.0):
+    """Measure projected image-space angles from normalized Pose landmarks."""
+    va = np.array([(a.x - b.x) * image_width,
+                   (a.y - b.y) * image_height], dtype=np.float32)
+    vc = np.array([(c.x - b.x) * image_width,
+                   (c.y - b.y) * image_height], dtype=np.float32)
     denom = float(np.linalg.norm(va) * np.linalg.norm(vc))
     if denom < 1e-6:
         return None
     cosine = float(np.clip(np.dot(va, vc) / denom, -1.0, 1.0))
     return float(np.degrees(np.arccos(cosine)))
-
 
 class ActivityClassifier:
     """Conservative standing/sitting rules based on visible Pose landmarks.
@@ -185,7 +203,7 @@ class ActivityClassifier:
             return (a.x + b.x) / 2.0, (a.y + b.y) / 2.0
         return None
 
-    def classify(self, landmarks):
+    def classify(self, landmarks, image_width=1.0, image_height=1.0):
         shoulder = self.pair(landmarks, "left_shoulder", "right_shoulder")
         hip = self.pair(landmarks, "left_hip", "right_hip")
         knee = self.pair(landmarks, "left_knee", "right_knee")
@@ -194,7 +212,7 @@ class ActivityClassifier:
             hip_p, knee_p, ankle_p = (landmarks[POSE[f"{side}_{joint}"]]
                                       for joint in ("hip", "knee", "ankle"))
             if all(visible(p) for p in (hip_p, knee_p, ankle_p)):
-                value = angle_degrees(hip_p, knee_p, ankle_p)
+                value = angle_degrees(hip_p, knee_p, ankle_p, image_width, image_height)
                 if value is not None:
                     knee_angles.append(value)
 
@@ -219,6 +237,39 @@ class ActivityClassifier:
         if count < 2:
             return "Unknown / insufficient evidence", 0.0
         return chosen, sum(support_values) / len(support_values)
+
+def pose_metrics(landmarks, image_width=1.0, image_height=1.0):
+    """Return measured joint angles and visibility for the tracked major joints."""
+    result = {}
+    for name, indexes in ANGLE_TRIPLETS.items():
+        points = [landmarks[index] for index in indexes]
+        value = (angle_degrees(*points, image_width, image_height)
+                 if all(visible(point) for point in points) else None)
+        result[name] = value
+
+    key_points = [landmarks[index] for _, index in POSE_TAGS]
+    visibility = [min(1.0, max(0.0, pose_visibility(point))) for point in key_points]
+    result["visible_count"] = sum(score >= MIN_LANDMARK_VISIBILITY for score in visibility)
+    result["mean_visibility"] = sum(visibility) / len(visibility) if visibility else 0.0
+    return result
+
+
+class FpsMeter:
+    """Smoothed frame-rate estimate based on elapsed processing time."""
+
+    def __init__(self, smoothing=0.15):
+        self.smoothing = smoothing
+        self.last_time = None
+        self.fps = 0.0
+
+    def tick(self, now):
+        if self.last_time is not None and now > self.last_time:
+            instantaneous = 1.0 / (now - self.last_time)
+            self.fps = (instantaneous if self.fps == 0.0 else
+                        (1.0 - self.smoothing) * self.fps + self.smoothing * instantaneous)
+        self.last_time = now
+        return self.fps
+
 
 def panel_text(canvas, x, y, text, color=WHITE, scale=0.48):
     text = str(text)
@@ -255,117 +306,141 @@ def draw_hand_label(frame, bounds, side, gesture, score):
 
 
 def draw_dashboard(frame, fps, hands, activity, activity_score, body_detected,
-                   resolution, events):
+                   resolution, events, pose_data):
     h, w = frame.shape[:2]
-    compact = h < 700
+    compact = h < 720
     output = np.zeros((h, w + PANEL_WIDTH, 3), dtype=np.uint8)
     output[:, :w] = frame
     output[:, w:] = PANEL
     x = w + 20
     right = w + PANEL_WIDTH - 18
 
-    panel_text(output, x, 29, "MOTIONSENSE", TEAL, 0.64 if compact else 0.72)
-    panel_text(output, x, 50 if compact else 60,
-               "LIVE GESTURE + BODY TRACKING", MUTED, 0.34)
-    cv2.line(output, (x, 63 if compact else 76),
-             (right, 63 if compact else 76), (67, 76, 91), 1, cv2.LINE_AA)
+    def y(value):
+        return int(value * min(1.0, h / 480.0 if compact else h / 720.0))
+
+    def s(value):
+        factor = min(1.0, h / 480.0 if compact else h / 720.0)
+        return max(0.25, value * factor)
+
+    panel_text(output, x, y(29 if compact else 36), "HUMAN SENSE AI", TEAL, s(0.68 if compact else 0.78))
+    panel_text(output, x, y(49 if compact else 63),
+               "REAL-TIME HUMAN ACTIVITY & POSE ANALYTICS", MUTED, s(0.32 if compact else 0.38))
+    cv2.line(output, (x, y(60 if compact else 79)),
+             (right, y(60 if compact else 79)), (67, 76, 91), 1, cv2.LINE_AA)
+
+    elbow_l = pose_data.get("elbow_left")
+    elbow_r = pose_data.get("elbow_right")
+    knee_l = pose_data.get("knee_left")
+    knee_r = pose_data.get("knee_right")
+
+    def format_angle(value):
+        return f"{value:.0f} deg" if value is not None else "--"
+
+    angle_line_elbow = f"Elbows  L {format_angle(elbow_l)}   R {format_angle(elbow_r)}"
+    angle_line_knee = f"Knees   L {format_angle(knee_l)}   R {format_angle(knee_r)}"
+    support = ("Evidence: torso + both leg chains"
+               if body_detected and activity_score > 0 else "Insufficient landmark evidence")
+    body_state = "TRACKING" if body_detected else "NO PERSON"
+    visibility = (f"Key joints  {pose_data.get('visible_count', 0)}/12  |  Mean visibility "
+                  f"{pose_data.get('mean_visibility', 0.0) * 100:.0f}%")
 
     if compact:
-        panel_text(output, x, 87, "CAMERA", MUTED, 0.36)
-        panel_text(output, x + 90, 87, "LIVE", TEAL, 0.40)
-        panel_text(output, x, 111, f"{resolution[0]} x {resolution[1]}    {fps:4.1f} FPS", WHITE, 0.42)
-        panel_text(output, x, 139, "BODY TRACKING", MUTED, 0.36)
-        panel_text(output, x + 146, 139, "ON" if body_detected else "NO PERSON",
-                   TEAL if body_detected else MUTED, 0.39)
-        panel_text(output, x, 169, "POSTURE", MUTED, 0.36)
-        panel_text(output, x, 193, activity, WHITE, 0.40)
-        support = (f"Landmark support  {activity_score * 100:.0f}%"
-                   if body_detected and activity_score > 0 else "Insufficient landmark evidence")
-        panel_text(output, x, 215, support, MUTED, 0.34)
-        cv2.line(output, (x, 230), (right, 230), (67, 76, 91), 1, cv2.LINE_AA)
-        panel_text(output, x, 253, f"HAND GESTURES   {len(hands)} / {NUM_HANDS}", MUTED, 0.36)
+        panel_text(output, x, y(82), "CAMERA", MUTED, s(0.34))
+        panel_text(output, x + 78, y(82), "LIVE", TEAL, s(0.40))
+        panel_text(output, x, y(104),
+                   f"{resolution[0]} x {resolution[1]}    {fps:4.1f} FPS", WHITE, s(0.38))
+        panel_text(output, x, y(131), f"POSE TRACKING  {body_state}",
+                   TEAL if body_detected else MUTED, s(0.36))
+        panel_text(output, x, y(154), "POSTURE ESTIMATE", MUTED, s(0.34))
+        panel_text(output, x, y(177), activity, WHITE, s(0.40))
+        panel_text(output, x, y(197), support, MUTED, s(0.32))
+        cv2.line(output, (x, y(207)), (right, y(207)), (67, 76, 91), 1, cv2.LINE_AA)
+        panel_text(output, x, y(229), "POSE ANALYTICS", MUTED, s(0.35))
+        panel_text(output, x, y(251), angle_line_elbow, WHITE, s(0.34))
+        panel_text(output, x, y(273), angle_line_knee, WHITE, s(0.34))
+        panel_text(output, x, y(295), visibility, MUTED, s(0.31))
+        cv2.line(output, (x, y(306)), (right, y(306)), (67, 76, 91), 1, cv2.LINE_AA)
+        panel_text(output, x, y(327), f"GESTURES  {len(hands)} / {NUM_HANDS}", MUTED, s(0.35))
         if not hands:
-            panel_text(output, x, 278, "Show one or both hands", MUTED, 0.37)
+            panel_text(output, x, y(350), "No supported gesture detected", MUTED, s(0.33))
         for index, (side, gesture, score) in enumerate(hands[:2]):
-            panel_text(output, x, 279 + index * 24,
-                       f"{side}   |   {gesture}   |   {score * 100:.0f}%", WHITE, 0.37)
-        cv2.line(output, (x, 333), (right, 333), (67, 76, 91), 1, cv2.LINE_AA)
-        panel_text(output, x, 356, "RECENT EVENTS", MUTED, 0.36)
+            panel_text(output, x, y(350 + index * 22),
+                       f"{side}  |  {gesture}  |  {score * 100:.0f}%", WHITE, s(0.34))
+        cv2.line(output, (x, y(386)), (right, y(386)), (67, 76, 91), 1, cv2.LINE_AA)
+        panel_text(output, x, y(407), "RECENT EVENTS", MUTED, s(0.35))
         if events:
             for index, (when, label) in enumerate(list(events)[:3]):
-                panel_text(output, x, 379 + index * 22, f"{when}  {label}", WHITE, 0.33)
+                panel_text(output, x, y(429 + index * 20), f"{when}  {label}", WHITE, s(0.30))
         else:
-            panel_text(output, x, 381, "Waiting for a detected gesture or pose", MUTED, 0.32)
-        panel_text(output, x, h - 10, "Use Quit button   |   posture is heuristic", MUTED, 0.29)
+            panel_text(output, x, y(430), "Waiting for detections", MUTED, s(0.32))
     else:
-        panel_text(output, x, 108, "CAMERA", MUTED, 0.39)
-        panel_text(output, x, 137, "LIVE", TEAL, 0.48)
-        panel_text(output, x, 166, f"Resolution  {resolution[0]} x {resolution[1]}")
-        panel_text(output, x, 194, f"Processing  {fps:4.1f} FPS")
-        cv2.line(output, (x, 211), (right, 211), (67, 76, 91), 1, cv2.LINE_AA)
-        panel_text(output, x, 241, "BODY TRACKING", MUTED, 0.39)
-        panel_text(output, x, 270, "TRACKING" if body_detected else "NO PERSON",
+        panel_text(output, x, y(112), "CAMERA", MUTED, 0.40)
+        panel_text(output, x + 90, y(112), "LIVE", TEAL, 0.48)
+        panel_text(output, x, y(145), f"{resolution[0]} x {resolution[1]}   |   {fps:4.1f} FPS")
+        panel_text(output, x, y(180), f"POSE TRACKING  {body_state}",
                    TEAL if body_detected else MUTED)
-        panel_text(output, x, 305, "POSTURE", MUTED, 0.39)
-        panel_text(output, x, 334, activity, WHITE, 0.47)
-        support = (f"Landmark support  {activity_score * 100:.0f}%"
-                   if body_detected and activity_score > 0 else "Insufficient landmark evidence")
-        panel_text(output, x, 360, support, MUTED, 0.36)
-        cv2.line(output, (x, 380), (right, 380), (67, 76, 91), 1, cv2.LINE_AA)
-        panel_text(output, x, 410, f"HAND GESTURES  {len(hands)} / {NUM_HANDS}", MUTED, 0.39)
-        y = 444
+        panel_text(output, x, y(218), "POSTURE ESTIMATE", MUTED, 0.40)
+        panel_text(output, x, y(248), activity, WHITE, 0.50)
+        panel_text(output, x, y(276), support, MUTED, 0.38)
+        cv2.line(output, (x, y(294)), (right, y(294)), (67, 76, 91), 1, cv2.LINE_AA)
+        panel_text(output, x, y(326), "POSE ANALYTICS", MUTED, 0.40)
+        panel_text(output, x, y(356), angle_line_elbow, WHITE, 0.38)
+        panel_text(output, x, y(383), angle_line_knee, WHITE, 0.38)
+        panel_text(output, x, y(410), visibility, MUTED, 0.35)
+        cv2.line(output, (x, y(428)), (right, y(428)), (67, 76, 91), 1, cv2.LINE_AA)
+        panel_text(output, x, y(460), f"GESTURES  {len(hands)} / {NUM_HANDS}", MUTED, 0.40)
         if not hands:
-            panel_text(output, x, y, "Show one or both hands", MUTED, 0.42)
-        for side, gesture, score in hands[:2]:
-            panel_text(output, x, y, f"{side}   |   {gesture}", WHITE, 0.40)
-            panel_text(output, x, y + 24, f"Model score  {score * 100:.0f}%", MUTED, 0.36)
-            y += 57
-        event_y = max(y + 8, 565)
-        cv2.line(output, (x, event_y - 18), (right, event_y - 18), (67, 76, 91), 1, cv2.LINE_AA)
-        panel_text(output, x, event_y + 5, "RECENT EVENTS", MUTED, 0.38)
+            panel_text(output, x, y(490), "No supported gesture detected", MUTED, 0.38)
+        for index, (side, gesture, score) in enumerate(hands[:2]):
+            panel_text(output, x, y(490 + index * 27),
+                       f"{side}  |  {gesture}  |  model score {score * 100:.0f}%", WHITE, 0.38)
+        cv2.line(output, (x, y(548)), (right, y(548)), (67, 76, 91), 1, cv2.LINE_AA)
+        panel_text(output, x, y(580), "RECENT EVENTS", MUTED, 0.40)
         if events:
             for index, (when, label) in enumerate(list(events)[:4]):
-                panel_text(output, x, event_y + 31 + index * 24, f"{when}  {label}", WHITE, 0.34)
+                panel_text(output, x, y(610 + index * 25), f"{when}  {label}", WHITE, 0.34)
         else:
-            panel_text(output, x, event_y + 31, "Waiting for detections", MUTED, 0.35)
-        panel_text(output, x, h - 18, "Use Quit button   |   posture is heuristic", MUTED, 0.32)
+            panel_text(output, x, y(612), "Waiting for detections", MUTED, 0.36)
     return output
 
-
 class MotionSenseApp:
-    """Tkinter controls around the existing OpenCV and MediaPipe pipeline."""
+    """Responsive Tkinter controls around one persistent CV worker thread."""
 
-    UI_BG = "#141820"
-    UI_PANEL = "#1d232d"
+    UI_BG = "#10141b"
+    UI_PANEL = "#1a202a"
     UI_TEXT = "#eef2f7"
     UI_MUTED = "#99a5b5"
     UI_TEAL = "#64dcbe"
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("MotionSense | Human Activity and Gesture Recognition")
+        self.root.title("Human Sense AI | Real-Time Human Activity and Pose Analytics")
         self.root.configure(bg=self.UI_BG)
-        self.root.minsize(760, 560)
-        self.root.geometry("1020x680")
+        self.root.geometry("1160x800")
+        self.root.minsize(960, 640)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
-        self.cap = None
-        self.recognizer = None
-        self.pose_landmarker = None
-        self.running = False
-        self.frames = 0
-        self.start_time = time.perf_counter()
-        self.fps = 0.0
-        self.last_tick = self.start_time
-        self.last_ts = -1
-        self.gesture_smoother = GestureSmoother()
-        self.activity_classifier = ActivityClassifier()
+        self.command_queue = queue.Queue()
+        self.status_queue = queue.Queue()
+        self.frame_queue = queue.Queue(maxsize=1)
         self.events = deque(maxlen=4)
-        self.previous_events = {}
+        self.worker_thread = None
+        self.ui_state = "stopped"
+        self.has_started = False
+        self.closing = False
+        self.latest_frame = None
         self.photo = None
+        self.resize_job = None
+        self.sized_to_camera = False
 
         self._build_ui()
-        self.root.after(15, self._update_frame)
+        self.worker_thread = threading.Thread(
+            target=self._camera_worker,
+            name="HumanSenseCameraWorker",
+            daemon=True,
+        )
+        self.worker_thread.start()
+        self.root.after(33, self._poll_worker)
 
     def _build_ui(self):
         style = ttk.Style(self.root)
@@ -378,70 +453,146 @@ class MotionSenseApp:
         style.configure("TLabel", background=self.UI_BG, foreground=self.UI_TEXT,
                         font=("Segoe UI", 10))
         style.configure("Brand.TLabel", background=self.UI_PANEL, foreground=self.UI_TEAL,
-                        font=("Segoe UI", 16, "bold"))
+                        font=("Segoe UI", 17, "bold"))
         style.configure("Sub.TLabel", background=self.UI_PANEL, foreground=self.UI_MUTED,
                         font=("Segoe UI", 9))
-        style.configure("Status.TLabel", background=self.UI_PANEL, foreground=self.UI_MUTED,
+        style.configure("Status.TLabel", background=self.UI_BG, foreground=self.UI_MUTED,
+                        font=("Segoe UI", 10))
+        style.configure("Live.TLabel", background=self.UI_BG, foreground=self.UI_TEAL,
+                        font=("Segoe UI", 10, "bold"))
+        style.configure("Starting.TLabel", background=self.UI_BG, foreground="#f2c879",
+                        font=("Segoe UI", 10, "bold"))
+        style.configure("Stopped.TLabel", background=self.UI_BG, foreground=self.UI_MUTED,
                         font=("Segoe UI", 10, "bold"))
         style.configure("Start.TButton", background="#167d73", foreground="#ffffff",
-                        padding=(14, 9), font=("Segoe UI", 10, "bold"), borderwidth=0)
+                        padding=(12, 9), font=("Segoe UI", 10, "bold"), borderwidth=0)
         style.map("Start.TButton", background=[("active", "#219688"), ("disabled", "#34434a")])
+        style.configure("Resume.TButton", background="#244f77", foreground="#ffffff",
+                        padding=(12, 9), font=("Segoe UI", 10, "bold"), borderwidth=0)
+        style.map("Resume.TButton", background=[("active", "#326d9f"), ("disabled", "#303943")])
         style.configure("Stop.TButton", background="#303846", foreground=self.UI_TEXT,
-                        padding=(14, 9), font=("Segoe UI", 10, "bold"), borderwidth=0)
+                        padding=(12, 9), font=("Segoe UI", 10, "bold"), borderwidth=0)
         style.map("Stop.TButton", background=[("active", "#414c5d"), ("disabled", "#282e38")])
         style.configure("Quit.TButton", background="#7d3944", foreground="#ffffff",
-                        padding=(14, 9), font=("Segoe UI", 10, "bold"), borderwidth=0)
+                        padding=(12, 9), font=("Segoe UI", 10, "bold"), borderwidth=0)
         style.map("Quit.TButton", background=[("active", "#a34654")])
 
         toolbar = ttk.Frame(self.root, style="Panel.TFrame", padding=(20, 14))
         toolbar.pack(fill="x", padx=14, pady=(14, 8))
         brand = ttk.Frame(toolbar, style="Panel.TFrame")
         brand.pack(side="left", fill="y")
-        ttk.Label(brand, text="MOTIONSENSE", style="Brand.TLabel").pack(anchor="w")
-        ttk.Label(brand, text="LIVE GESTURE + BODY TRACKING", style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Label(brand, text="HUMAN SENSE AI", style="Brand.TLabel").pack(anchor="w")
+        ttk.Label(brand, text="REAL-TIME HUMAN ACTIVITY & POSE ANALYTICS",
+                  style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
 
         controls = ttk.Frame(toolbar, style="Panel.TFrame")
         controls.pack(side="right", anchor="center")
         self.start_button = ttk.Button(controls, text="Start Camera", style="Start.TButton",
                                        command=self.start_camera)
-        self.start_button.pack(side="left", padx=(0, 8))
+        self.start_button.pack(side="left", padx=(0, 7))
+        self.resume_button = ttk.Button(controls, text="Resume Camera", style="Resume.TButton",
+                                        command=self.resume_camera, state="disabled")
+        self.resume_button.pack(side="left", padx=(0, 7))
         self.stop_button = ttk.Button(controls, text="Stop Camera", style="Stop.TButton",
                                       command=self.stop_camera, state="disabled")
-        self.stop_button.pack(side="left", padx=(0, 8))
-        ttk.Button(controls, text="Quit", style="Quit.TButton",
-                   command=self.quit).pack(side="left")
+        self.stop_button.pack(side="left", padx=(0, 7))
+        self.quit_button = ttk.Button(controls, text="Quit Application", style="Quit.TButton",
+                                      command=self.quit)
+        self.quit_button.pack(side="left")
 
         status_bar = ttk.Frame(self.root, style="TFrame")
         status_bar.pack(fill="x", padx=20, pady=(0, 8))
+        self.live_badge = ttk.Label(status_bar, text="STOPPED", style="Stopped.TLabel")
+        self.live_badge.pack(side="left", padx=(0, 12))
         self.status_label = ttk.Label(status_bar, text="Camera stopped - press Start Camera",
                                       style="Status.TLabel")
         self.status_label.pack(side="left")
-        self.view_label = tk.Label(self.root, bg="#0d1117", fg=self.UI_MUTED,
-                                   text="Camera is stopped\n\nSelect Start Camera to begin",
+
+        self.view_label = tk.Label(self.root, bg="#0b0f15", fg=self.UI_MUTED,
+                                   text="CAMERA STOPPED\n\nSelect Start Camera to begin",
                                    font=("Segoe UI", 14), justify="center", bd=0,
                                    highlightthickness=1, highlightbackground="#303846")
         self.view_label.pack(fill="both", expand=True, padx=14, pady=(0, 8))
-        ttk.Label(self.root,
-                  text="Gesture scores come from the model. Posture is a conservative landmark rule.",
-                  foreground=self.UI_MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(0, 12))
+        self.view_label.bind("<Configure>", self._on_view_resize)
+        ttk.Label(
+            self.root,
+            text="Gesture scores are model outputs. Posture is a landmark heuristic, not a probability; angles are image-space only.",
+            foreground=self.UI_MUTED, font=("Segoe UI", 9), wraplength=1100,
+        ).pack(anchor="w", padx=20, pady=(0, 12))
 
-    def _set_status(self, message, color=None):
-        self.status_label.configure(text=message,
-                                    foreground=color or self.UI_MUTED)
+    def _set_status(self, message, state=None):
+        status_color = "#ff9b9b" if state == "error" else self.UI_MUTED
+        self.status_label.configure(text=message, foreground=status_color)
+        if state == "live":
+            self.live_badge.configure(text="LIVE", style="Live.TLabel")
+        elif state == "starting":
+            self.live_badge.configure(text="STARTING", style="Starting.TLabel")
+        elif state == "stopping":
+            self.live_badge.configure(text="STOPPING", style="Starting.TLabel")
+        else:
+            self.live_badge.configure(text="STOPPED", style="Stopped.TLabel")
 
-    def _ensure_models(self):
-        if self.recognizer is None:
-            gesture_path = find_model("gesture_recognizer.task")
-            self.recognizer = Vision.GestureRecognizer.create_from_options(
+    def _set_controls(self):
+        if self.closing:
+            for button in (self.start_button, self.resume_button, self.stop_button):
+                button.configure(state="disabled")
+            self.quit_button.configure(state="disabled")
+        elif self.ui_state in ("starting", "running", "stopping"):
+            self.start_button.configure(state="disabled")
+            self.resume_button.configure(state="disabled")
+            self.stop_button.configure(state="normal" if self.ui_state != "stopping" else "disabled")
+        elif self.has_started:
+            self.start_button.configure(state="disabled")
+            self.resume_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+            self.quit_button.configure(state="normal")
+        else:
+            self.start_button.configure(state="normal")
+            self.resume_button.configure(state="disabled")
+            self.stop_button.configure(state="disabled")
+            self.quit_button.configure(state="normal")
+
+    def start_camera(self):
+        if self.closing or self.has_started or self.ui_state != "stopped":
+            return
+        self._request_camera_start()
+
+    def resume_camera(self):
+        if self.closing or not self.has_started or self.ui_state != "stopped":
+            return
+        self._request_camera_start()
+
+    def _request_camera_start(self):
+        self.ui_state = "starting"
+        self._set_controls()
+        self._set_status("Opening camera and preparing models...", "starting")
+        self.command_queue.put("start")
+
+    def stop_camera(self):
+        if self.ui_state not in ("starting", "running"):
+            return
+        self.ui_state = "stopping"
+        self._set_controls()
+        self._set_status("Stopping camera and releasing capture...", "stopping")
+        self.command_queue.put("stop")
+
+    def _record_event(self, label):
+        self.events.appendleft((time.strftime("%H:%M:%S"), label))
+
+    def _load_models(self):
+        gesture_path = find_model("gesture_recognizer.task")
+        pose_path = find_model("pose_landmarker_lite.task")
+        recognizer = None
+        pose_landmarker = None
+        try:
+            recognizer = Vision.GestureRecognizer.create_from_options(
                 Vision.GestureRecognizerOptions(
                     base_options=BaseOptions(model_asset_buffer=gesture_path.read_bytes()),
                     running_mode=Vision.RunningMode.VIDEO,
                     num_hands=NUM_HANDS,
                 )
             )
-        if self.pose_landmarker is None:
-            pose_path = find_model("pose_landmarker_lite.task")
-            self.pose_landmarker = Vision.PoseLandmarker.create_from_options(
+            pose_landmarker = Vision.PoseLandmarker.create_from_options(
                 Vision.PoseLandmarkerOptions(
                     base_options=BaseOptions(model_asset_buffer=pose_path.read_bytes()),
                     running_mode=Vision.RunningMode.VIDEO,
@@ -451,61 +602,126 @@ class MotionSenseApp:
                     min_tracking_confidence=0.5,
                 )
             )
+        except Exception:
+            if recognizer is not None:
+                recognizer.close()
+            if pose_landmarker is not None:
+                pose_landmarker.close()
+            raise
+        print(f"Gesture model: {gesture_path}")
+        print(f"Pose model: {pose_path}")
+        return recognizer, pose_landmarker
 
-    def start_camera(self):
-        if self.running:
-            return
+    def _publish_frame(self, frame):
         try:
-            if self.cap is None:
-                self.cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-            if not self.cap.isOpened():
-                raise RuntimeError(
-                    f"Could not open camera index {CAMERA_INDEX}. Check camera access and close other camera apps."
-                )
-            self._ensure_models()
-            self.running = True
-            self.frames = 0
-            self.fps = 0.0
-            self.last_tick = time.perf_counter()
-            self.gesture_smoother = GestureSmoother()
-            self.activity_classifier = ActivityClassifier()
-            self.previous_events.clear()
-            self.start_button.configure(state="disabled")
-            self.stop_button.configure(state="normal")
-            self._set_status("Camera live - show your hands or stand in view", self.UI_TEAL)
-            print(f"Gesture model: {find_model('gesture_recognizer.task')}")
-            print(f"Pose model: {find_model('pose_landmarker_lite.task')}")
-        except Exception as error:
-            self._release_camera()
-            self._set_status(f"Could not start camera: {error}", "#ff9b9b")
-            self.start_button.configure(state="normal")
-            self.stop_button.configure(state="disabled")
+            self.frame_queue.put_nowait(frame)
+        except queue.Full:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.frame_queue.put_nowait(frame)
+            except queue.Full:
+                pass
 
-    def stop_camera(self):
-        was_running = self.running
-        self.running = False
-        self._release_camera()
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled")
-        if was_running:
-            self._set_status("Camera stopped - press Start Camera to resume")
-            self.view_label.configure(image="", text="Camera is stopped\n\nSelect Start Camera to resume")
-            self.photo = None
+    @staticmethod
+    def _release_capture(capture):
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
 
-    def _release_camera(self):
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
 
-    def _process_frame(self, frame):
+    def _camera_worker(self):
+        recognizer = None
+        pose_landmarker = None
+        cap = None
+        active = False
+        while True:
+            if not active:
+                command = self.command_queue.get()
+                if command == "quit":
+                    break
+                if command != "start":
+                    continue
+                try:
+                    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+                    if not cap.isOpened():
+                        raise RuntimeError(
+                            f"Could not open camera index {CAMERA_INDEX}. Check access and close other camera apps."
+                        )
+                    if recognizer is None or pose_landmarker is None:
+                        recognizer, pose_landmarker = self._load_models()
+                    self._record_event("Camera started")
+                    self.status_queue.put(("started", None))
+                    self.gesture_smoother = GestureSmoother()
+                    self.activity_classifier = ActivityClassifier()
+                    self.fps_meter = FpsMeter()
+                    self.previous_gestures = {}
+                    self.previous_posture = None
+                    self.previous_pose_detected = None
+                    active = True
+                except Exception as error:
+                    if cap is not None:
+                        self._release_capture(cap)
+                        cap = None
+                    self._record_event(f"Camera error: {error}")
+                    self.status_queue.put(("stopped", str(error)))
+                continue
+
+            try:
+                command = self.command_queue.get_nowait()
+            except queue.Empty:
+                command = None
+            if command == "quit":
+                break
+            if command == "stop":
+                if cap is not None:
+                    self._release_capture(cap)
+                    cap = None
+                active = False
+                self._record_event("Camera stopped")
+                self.status_queue.put(("stopped", None))
+                continue
+            if command == "start":
+                continue
+
+            try:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    raise RuntimeError("Camera returned no frame")
+                dashboard = self._process_frame(frame, recognizer, pose_landmarker)
+                self._publish_frame(dashboard)
+            except Exception as error:
+                if cap is not None:
+                    self._release_capture(cap)
+                    cap = None
+                active = False
+                self._record_event(f"Camera error: {error}")
+                self.status_queue.put(("stopped", str(error)))
+
+        if active:
+            self._record_event("Camera stopped")
+        self._release_capture(cap)
+        for resource in (recognizer, pose_landmarker):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception as error:
+                    self.status_queue.put(("warning", str(error)))
+        self.status_queue.put(("closed", None))
+
+    def _process_frame(self, frame, recognizer, pose_landmarker):
         frame = cv2.flip(frame, 1)
         height, width = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        timestamp = max(int(time.monotonic() * 1000), self.last_ts + 1)
+        timestamp = max(int(time.monotonic() * 1000), getattr(self, "last_ts", -1) + 1)
         self.last_ts = timestamp
-        gesture_result = self.recognizer.recognize_for_video(image, timestamp)
-        pose_result = self.pose_landmarker.detect_for_video(image, timestamp)
+        gesture_result = recognizer.recognize_for_video(image, timestamp)
+        pose_result = pose_landmarker.detect_for_video(image, timestamp)
 
         details = []
         for index, landmarks in enumerate(gesture_result.hand_landmarks):
@@ -521,19 +737,33 @@ class MotionSenseApp:
         if body_detected:
             pose = pose_result.pose_landmarks[0]
             draw_pose(frame, pose)
-            activity, activity_score = self.activity_classifier.classify(pose)
+            activity, activity_score = self.activity_classifier.classify(pose, width, height)
+            metrics = pose_metrics(pose, width, height)
         else:
             activity, activity_score = "No person detected", 0.0
             self.activity_classifier.labels.clear()
+            metrics = {key: None for key in ANGLE_TRIPLETS}
+            metrics.update({"visible_count": 0, "mean_visibility": 0.0})
 
-        current_events = {"posture": activity if body_detected else "No person"}
-        current_events.update({f"hand:{side}": gesture for side, gesture, _ in details})
-        for key, label in current_events.items():
-            if (label not in ("Unknown", "Unknown / insufficient evidence", "No person detected")
-                    and self.previous_events.get(key) != label):
-                kind = "Pose" if key == "posture" else key.split(":", 1)[1]
-                self.events.appendleft((time.strftime("%H:%M:%S"), f"{kind} | {label}"))
-        self.previous_events = current_events
+        if body_detected and self.previous_pose_detected is not True:
+            self._record_event("Pose tracking restored")
+        elif not body_detected and self.previous_pose_detected is True:
+            self._record_event("Pose tracking lost")
+        self.previous_pose_detected = body_detected
+
+        if activity != self.previous_posture and (
+                activity in ("Standing", "Sitting") or self.previous_posture in ("Standing", "Sitting")):
+            self._record_event(f"Posture: {activity}")
+        self.previous_posture = activity
+
+        current_gestures = {side: gesture for side, gesture, _ in details
+                            if gesture not in ("Unknown", "Unknown / insufficient evidence")}
+        for side, gesture in current_gestures.items():
+            if self.previous_gestures.get(side) != gesture:
+                self._record_event(f"Gesture {side}: {gesture}")
+        for side in self.previous_gestures.keys() - current_gestures.keys():
+            self._record_event(f"Gesture tracking lost: {side}")
+        self.previous_gestures = current_gestures
 
         activity_text = f"POSTURE  {activity.upper()}"
         (activity_w, activity_h), activity_base = cv2.getTextSize(
@@ -546,60 +776,113 @@ class MotionSenseApp:
                       CYAN, 1, cv2.LINE_AA)
         put_text(frame, activity_text, (21, 12 + activity_h + 8), 0.52, CYAN)
 
-        now = time.perf_counter()
-        dt = now - self.last_tick
-        self.last_tick = now
-        if dt > 0:
-            instantaneous = 1.0 / dt
-            self.fps = instantaneous if self.fps == 0.0 else 0.9 * self.fps + 0.1 * instantaneous
-        self.frames += 1
-        return draw_dashboard(frame, self.fps, details, activity, activity_score,
-                              body_detected, (width, height), self.events)
+        fps = self.fps_meter.tick(time.perf_counter())
+        return draw_dashboard(frame, fps, details, activity, activity_score,
+                              body_detected, (width, height), self.events, metrics)
 
-    def _update_frame(self):
-        if self.running and self.cap is not None:
+    def _on_view_resize(self, event):
+        self.view_label.configure(wraplength=max(400, event.width - 40))
+        if self.latest_frame is not None and self.resize_job is None:
+            self.resize_job = self.root.after(80, self._render_latest_frame)
+
+    def _render_latest_frame(self):
+        self.resize_job = None
+        if self.latest_frame is None or self.closing:
+            return
+        frame = self.latest_frame
+        source_h, source_w = frame.shape[:2]
+        target_w = max(1, self.view_label.winfo_width() - 8)
+        target_h = max(1, self.view_label.winfo_height() - 8)
+        ratio = min(1.0, target_w / source_w, target_h / source_h)
+        if ratio < 0.995:
+            frame = cv2.resize(frame, (max(1, int(source_w * ratio)),
+                                       max(1, int(source_h * ratio))),
+                               interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".png", frame)
+        if not ok:
+            return
+        image_data = base64.b64encode(encoded.tobytes()).decode("ascii")
+        self.photo = tk.PhotoImage(master=self.root, data=image_data)
+        self.view_label.configure(image=self.photo, text="")
+        if not self.sized_to_camera:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            window_w = min(1440, max(1000, source_w + 40), screen_w - 60)
+            window_h = min(980, max(650, source_h + 210), screen_h - 80)
+            self.root.geometry(f"{max(760, window_w)}x{max(560, window_h)}")
+            self.sized_to_camera = True
+
+    def _show_stopped_view(self, error=None):
+        self.latest_frame = None
+        self.photo = None
+        title = "CAMERA STOPPED"
+        if error:
+            title = f"CAMERA ERROR\n\n{error}"
+        recent = "\n".join(f"{when}  {label}" for when, label in list(self.events)[:4])
+        text = f"{title}\n\n" + (recent or "Select Start Camera or Resume Camera")
+        self.view_label.configure(image="", text=text)
+
+    def _poll_worker(self):
+        stopped_error = None
+        closed = False
+        while True:
             try:
-                ok, frame = self.cap.read()
-                if not ok or frame is None:
-                    raise RuntimeError("Camera returned no frame")
-                dashboard = self._process_frame(frame)
-                max_width = 1240
-                if dashboard.shape[1] > max_width:
-                    ratio = max_width / dashboard.shape[1]
-                    dashboard = cv2.resize(
-                        dashboard,
-                        (max_width, max(1, int(dashboard.shape[0] * ratio))),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                ok, encoded = cv2.imencode(".png", dashboard)
-                if not ok:
-                    raise RuntimeError("Could not render the camera frame")
-                image_data = base64.b64encode(encoded.tobytes()).decode("ascii")
-                self.photo = tk.PhotoImage(master=self.root, data=image_data)
-                if self.frames == 1:
-                    window_width = min(1320, max(1000, dashboard.shape[1] + 40))
-                    window_height = min(900, max(650, dashboard.shape[0] + 150))
-                    self.root.geometry(f"{window_width}x{window_height}")
-                self.view_label.configure(image=self.photo, text="")
-            except Exception as error:
-                self.stop_camera()
-                self._set_status(f"Camera stopped: {error}", "#ff9b9b")
-        self.root.after(15, self._update_frame)
+                kind, payload = self.status_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "started":
+                self.has_started = True
+                self.ui_state = "running"
+                self._set_controls()
+                self._set_status("Camera live - gesture and pose tracking active", "live")
+                self.sized_to_camera = False
+            elif kind == "stopped":
+                stopped_error = payload
+                self.ui_state = "stopped"
+            elif kind == "closed":
+                closed = True
+
+        if self.ui_state == "running":
+            newest = None
+            while True:
+                try:
+                    newest = self.frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if newest is not None:
+                self.latest_frame = newest
+                self._render_latest_frame()
+        else:
+            while True:
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+        if stopped_error is not None or self.ui_state == "stopped":
+            self._set_controls()
+            self._show_stopped_view(stopped_error)
+            if stopped_error:
+                self._set_status(f"Camera unavailable: {stopped_error}", "error")
+            else:
+                self._set_status("Camera stopped - use Resume Camera to continue")
+        if closed and self.closing:
+            self.root.destroy()
+            return
+        if not self.closing:
+            self.root.after(33, self._poll_worker)
 
     def quit(self):
-        self.running = False
-        self._release_camera()
-        if self.recognizer is not None:
-            self.recognizer.close()
-            self.recognizer = None
-        if self.pose_landmarker is not None:
-            self.pose_landmarker.close()
-            self.pose_landmarker = None
-        self.root.destroy()
+        if self.closing:
+            return
+        self.closing = True
+        self.ui_state = "closing"
+        self._set_controls()
+        self._set_status("Closing camera and models...", "stopping")
+        self.command_queue.put("quit")
 
     def run(self):
         self.root.mainloop()
-
 
 def main():
     app = MotionSenseApp()
@@ -608,6 +891,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (FileNotFoundError, RuntimeError, OSError) as error:
-        print(f"MotionSense could not start: {error}", file=sys.stderr)
+    except (FileNotFoundError, RuntimeError, OSError, tk.TclError) as error:
+        print(f"Human Sense AI could not start: {error}", file=sys.stderr)
         raise SystemExit(1)
